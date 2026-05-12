@@ -135,8 +135,29 @@ class Layer():
     pass
 
 
-def pbfs(start_node, adjacency_bag, state, nodes):
-    pass
+def pbfs(start_node, adjacency_bag, state=None):
+    """"""
+    # Set-up PBFS
+    if not state:
+        num_nodes = adjacency_bag.count().compute()
+        state = np.full(len(num_nodes), "U", "<U1") # nodes i maps to state i
+    all_adj_df = adjacency_bag.to_dataframe(
+        meta = {"pre": int, "neighbours": object})
+    depth, level_nodes = 0, ddf.from_dict({"node_id": [start_node]})    
+    levels = []    
+    
+    # Run PBFS, accumulating Levels
+    while True:
+        new_level = Level(depth, level_nodes, state, node_to_i, all_adj_df)
+        levels.append(new_level)
+        # TODO : mark level_nodes as processed
+        level_nodes = new_level.get_children()
+        if level_nodes.count().compute() == 0:
+            break
+        # TODO : mark level nodes as discovered        
+        depth += 1
+    
+    return (levels, state)
 
 
 def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
@@ -167,7 +188,7 @@ def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
             
             all_child_parent_rels, state, leaves = pbfs(start_node, 
                                                         big_adjacency_bag,
-                                                        state, nodes)
+                                                        state)
             del all_child_parent_rels, leaves
             
             # Add new component

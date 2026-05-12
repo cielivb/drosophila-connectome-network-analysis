@@ -187,8 +187,26 @@ class Level():
     def _get_num_sps(self, level_nodes: ddf.DataFrame, parent_level: Level):
         """ Return the number of shortest paths to each node on this level, as
         well as the child-parent relationships discovered in the process where
-        the children are the nodes belonging to this level. """
+        the children are the nodes belonging to this level. 
+        
+        The num_shortest_paths bag is of the general form
+        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
+        where num_paths is the number of shortest paths from start_node to node1 etc
+        """
         pass # TODO
+    
+    def assign_credit(self, to_child_edge_scores=None):
+        """ 
+        Implements Rules 1&2 of MMDS Chapter 10 pg 365. Each node gets a credit 
+        of 1 plus the sum of the credits of the DAG edges from that node to the 
+        level below. A leaf node will only have a credit of 1. """
+        pass # TODO
+    
+    def get_edge_scores(self):
+        """ Return Bag of tuples Bag([((pre, post), edge_score), ...])
+        for each edge between the nodes of this level and their parents.
+        Edge scoring rules are detailed on page 365 of MMDS Chapter 10 """
+        pass # TODO    
 
 
 def pbfs(start_node: int, adjacency_bag, state=None):
@@ -343,85 +361,41 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
 
-def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, 
-                          leaves, component):
-    """ Return Bag of tuples Bag([((pre, post), edge_score), ...])
-    Edge scoring rules are detailed on page 365 of MMDS Chapter 10 
+def get_initial_edge_scores(start_node, component):
+    """ Run one PBFS then one PBFS backtrack then collate edge scores.
+    Return Bag of Girvan Newman edge scores starting at start_node, of general 
+    form Bag of tuples Bag([((pre, post), edge_score), ...]) """
+    levels, state = pbfs(start_node, component)
+    del state
     
-    The num_shortest_paths bag is of the general form
-        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
-    where num_paths is the number of shortest paths from start_node to node1 etc
+    # PBFS backtrack to get edge scores
+    scores = [] # List of Bags of edge scores
+    levels = levels[::-1] # order levels from deepest at index 0 to root at end
+    for i, level in enumerate(levels): 
+        # Edge scores in a given level depend on the deeper level's edge scores
+        level.assign_credit(scores[-1]) if scores else level.assign_credit()
+        edge_score_list.append(level.get_edge_scores())
     
-    """
-    num_sp = dict(num_shortest_paths.compute()) # Quick look-up
-    to_score = leaves
-    edge_scores = db.from_sequence([])
-    all_child_parent_rels = dict(child_parent_rels.compute())
-    
-    def credit(node):
-        """ Rule 1: leaves get credit = 1. Rule 2: other nodes get credit = 1 + 
-        sum of credits of the DAG edges from that node to its children """
-        credit = 1 + edge_scores.filter(
-            lambda entry: entry[0][0] == node).map(
-                lambda entry: entry[1]).sum().compute()
-        return (node, credit)
-    
-    def process_nodes(node_w_credit):
-        """ Rule 3: A DAG edge e entering node Z from the level above is given a
-        share of the credit of Z proportional to the fraction of shortest
-        paths from the root to Z that go through e.
-        """
-        node, credit = node_w_credit
-        parents = db.from_sequence(all_child_parent_rels[node])
-        total_num_shortest_paths_to_parents = parents.map(
-            lambda parent: num_shortest_paths[parent[0]])
-        node_edge_scores = parents.map(
-            lambda parent: ((parent[0], node), 
-                            credit * num_shortest_paths[parent[0]] / 
-                            total_num_shortest_paths_to_parents))
-        return node_edge_scores
-        
-    while to_score.count().compute() > 0:
-        print(f"Nodes to score = {to_score.compute()}")
-        nodes_w_credits = to_score.map(credit)
-        new_edge_scores = nodes_w_credits.map(process_nodes).flatten()
-        edge_scores = db.concat([edge_scores, new_edge_scores])
-        to_score = nodes_w_credits.map( # to_score = parents
-            lambda node_w_c: all_child_parent_rels[node_w_c[0]]).flatten()
-        
-    return edge_scores
+    # Create and return dask bag of edge scores of general form
+    # Bag([((pre, post), edge_score), ...])
+    score_bag = db.concat(scores)
+    return score_bag
 
 
-def get_edge_scores(start_node, component):
-    """ Return dict of Girvan Newman edge scores starting at start_node.
-    df should only contain pre, post, and syn_count cols """
-    print("\nRunning PBFS ...")
-    child_parent_rels, state, leaves, num_shortest_paths = pbfs(start_node, component)
-    print("Ran PBFS")
-    print("\nCalculating edge scores ...")
-    edge_scores = calculate_edge_scores(start_node, child_parent_rels, 
-                                        num_shortest_paths, leaves, component)
-    print("Calculated edge scores")
-    return edge_scores
-
-
-def girvan_newman(component):
+def get_edge_scores(component):
     """ Set up and do the edge-score calculation phase of Girvan-Newman on a 
     single component """
     # Map random subset of nodes to get_edge_scores.
     # For now, using sample size = quarter the number of nodes in the df.
-    print("Getting random node subset ...")
     component_nodes = get_all_nodes(component).compute()
     random_nodes = db.from_sequence(
         random.sample(component_nodes, int(len(component_nodes)/4)))
-    print(f"Using nodes {random_nodes.compute()}")
     
     # Bag([((pre, post), edge_score), ...])
-    print("Getting edge scores ...")
     all_edge_scores = random_nodes.map(
-        lambda start_node: get_edge_scores(start_node, component)).flatten()
-    print("Got edge scores")
+        lambda start_node: get_initial_edge_scores(start_node, component)).flatten()
     
+    # TODO - make the below preserve edge identity (pre, post)
     # Sum edge scores and divide by factor
     factor = 0.5 # Used sample size = quarter # nodes in df -> factor = 0.5
     scores = all_edge_scores.foldby(
@@ -465,7 +439,7 @@ def chop(component, edge_scores, upper_threshold):
 
 ### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
 
-def process_component(component):
+def modified_girvan_newman(component):
     """ Returns a bag of components and whether processing should continue.
     Bag([(component1_bag, _continue), (component2_bag, _continue), ...])
     where component1, component2, ... are components derived from component.
@@ -478,7 +452,7 @@ def process_component(component):
     Takes a bag called component representing the edges of a component.
     """
     global MIN_CLUSTER_SIZE
-    edge_scores = girvan_newman(component)
+    edge_scores = get_edge_scores(component)
     upper_score_threshold = get_upper_threshold(edge_scores)
     new_adj_bag, removed_edges = chop(component, edge_scores, upper_score_threshold)
     log_removed_edges(removed_edges)
@@ -496,6 +470,8 @@ def recurse(component):
 
 
 def identify_clusters(df=None, adjacency_bags=None):
+    """ Run modified grivan newman and prune components until no more iterations
+    can be performed. """
     global MIN_CLUSTER_SIZE, CLIENT
     
     # Clean and filter
@@ -505,7 +481,7 @@ def identify_clusters(df=None, adjacency_bags=None):
         lambda adj_bag: adj_bag.count >= MIN_CLUSTER_SIZE)
     
     # Bag([(component1_bag, continue), (component2_bag, continue), ...])
-    components = adjacency_bags.map(process_component).flatten()
+    components = adjacency_bags.map(modified_girvan_newman).flatten()
     components = components.map(lambda component: recurse(component))
     
     # Filter and map components to include only bags

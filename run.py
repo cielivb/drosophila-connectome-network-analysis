@@ -144,27 +144,18 @@ class Level():
     """
     
     def __init__(self, depth: int, level_nodes: ddf.DataFrame, 
-                 state: ddf.DataFrame, parent_level: Level, 
-                 all_adj_df: ddf.DataFrame):
+                 parent_level: Level):
         """ Store dask graphs in self for later use """
-        global CLIENT
         self.nodes, self.depth = level_nodes, depth
-        self._discover_nodes(level_nodes, node_to_i, state)
-        self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
-        self.children, self.pc_rels = self._get_pc_rels(self.adj_df, state, node_to_i)
-        self.num_sps, self.cp_rels = self._num_sps(self.nodes, parent_level)
-        CLIENT.cancel(self.adj_df)
-        
+        self.parent_level = parent_level
+        self.children, self.pc_rels = None, None
+        self.num_sps, self.cp_rels = None, None
+    
     def __del__(self):
         """ Free memory held by persisted dask graphs before deleting """
         global CLIENT
         CLIENT.cancel([self.nodes, self.children, self.pc_rels, 
                        self.num_sps, self.cp_rels])
-        
-    def _discover_nodes(self, level_nodes: ddf.DataFrame, state: ddf.Dataframe):
-        """ Mark level nodes as discovered (D) in state array """
-        indices = node_to_i.loc[node_to_i.index.isin(level_nodes["node_id"])]
-        
     
     def _get_self_adj_df(self, level_nodes: ddf.DataFrame, all_adj_df: ddf.DataFrame):
         """ Join level_nodes dataframe with all_adj_df on node_id column.
@@ -205,6 +196,31 @@ class Level():
         where num_paths is the number of shortest paths from start_node to node1 etc
         """
         pass # TODO
+    
+    ### PBFS functions ----------------------------------------------------
+        
+    def _discover_nodes(self, level_nodes: ddf.DataFrame, state: ddf.Dataframe):
+        """ Mark level nodes as discovered (D) in state array """
+        indices = node_to_i.loc[node_to_i.index.isin(level_nodes["node_id"])]
+        rows_to_update = state.loc[state.index.isin(level_nodes["node_id"])]
+        
+    def update_node_states(self, new_status, state):
+        """ Update states of self.nodes in state dataframe to either D or P """
+        if new_status not in {"D", "P"}: 
+            raise Exception(f"Invalid new status {new_status}. Must be D or P.")
+        indexes_to_update = state.index.isin(level_nodes["node_id"])
+        state["state"] = state["state"].mask(indexes_to_update, new_status)
+        return state
+        
+    def process(self, state, all_adj_df):
+        """ Assign task graphs to self for calculating edge scores later """
+        global CLIENT        
+        adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
+        self.children, self.pc_rels = self._get_pc_rels(adj_df, state, node_to_i)
+        self.num_sps, self.cp_rels = self._num_sps(self.nodes, parent_level)
+        CLIENT.cancel(adj_df)          
+    
+    ### PBFS Backtrack functions ------------------------------------------
     
     def assign_credit(self, to_child_edge_scores=None):
         """ 
@@ -251,15 +267,19 @@ def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state: ddf.DataFrame):
     # Run PBFS, accumulating Levels
     parent_level = None    
     while True:
-        new_level = Level(depth, level_nodes, state, parent_level, all_adj_df)
-        levels.append(new_level)
-        # TODO : mark level_nodes as processed
-        level_nodes = new_level.children
+        # Process new level
+        current_level = Level(depth, level_nodes, parent_level)
+        current_level.update_node_states("D", state)
+        current_level.process(state, all_adj_df)
+        current_level.update_node_states("P", state)
+        levels.append(current_level)
+        
+        # Create child level and make it the current level
+        parent_level = current_level
+        level_nodes = parent_level.children
         if level_nodes.count().compute() == 0:
             break
-        # TODO : mark level nodes as discovered        
         depth += 1
-        parent_level = levels[-1]
     
     return (levels, state)
 

@@ -209,7 +209,7 @@ class Level():
         pass # TODO    
 
 
-def pbfs(start_node: int, adjacency_bag, state=None):
+def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state=None):
     """ Run a parallel breadth-first-search on the graph represented by 
     adjacency_bag, starting at start_node. Returns a list of Levels in order of
     depth and the state array.
@@ -237,8 +237,6 @@ def pbfs(start_node: int, adjacency_bag, state=None):
     if not state:
         num_nodes = adjacency_bag.count().compute()
         state = np.full(len(num_nodes), "U", "<U1") # nodes i maps to state i
-    all_adj_df = adjacency_bag.to_dataframe(
-        meta = {"node_id": int, "neighbours": object})
     depth, level_nodes = 0, ddf.from_dict({"node_id": [start_node]})    
     levels = []    
     
@@ -361,11 +359,11 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
 
-def get_initial_edge_scores(start_node, component):
+def get_initial_edge_scores(start_node, all_adj_df):
     """ Run one PBFS then one PBFS backtrack then collate edge scores.
     Return Bag of Girvan Newman edge scores starting at start_node, of general 
     form Bag of tuples Bag([((pre, post), edge_score), ...]) """
-    levels, state = pbfs(start_node, component)
+    levels, state = pbfs(start_node, all_adj_df)
     del state
     
     # PBFS backtrack to get edge scores
@@ -391,9 +389,13 @@ def get_edge_scores(component):
     random_nodes = db.from_sequence(
         random.sample(component_nodes, int(len(component_nodes)/4)))
     
+    # Put component bag into format suitable for set membership testing
+    all_adj_df = component.to_dataframe(
+        meta = {"node_id": int, "neighbours": object})
+    
     # Bag([((pre, post), edge_score), ...])
     all_edge_scores = random_nodes.map(
-        lambda start_node: get_initial_edge_scores(start_node, component)).flatten()
+        lambda start_node: get_initial_edge_scores(start_node, all_adj_df)).flatten()
     
     # TODO - make the below preserve edge identity (pre, post)
     # Sum edge scores and divide by factor

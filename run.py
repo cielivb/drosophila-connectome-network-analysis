@@ -144,11 +144,12 @@ class Level():
     """
     
     def __init__(self, depth: int, level_nodes: ddf.DataFrame, 
-                 state: np.ndarray, node_to_i: dict, 
-                 parent_level: Level, all_adj_df: ddf.DataFrame):
+                 state: ddf.DataFrame, parent_level: Level, 
+                 all_adj_df: ddf.DataFrame):
         """ Store dask graphs in self for later use """
         global CLIENT
         self.nodes, self.depth = level_nodes, depth
+        self._discover_nodes(level_nodes, node_to_i, state)
         self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
         self.children, self.pc_rels = self._get_pc_rels(self.adj_df, state, node_to_i)
         self.num_sps, self.cp_rels = self._num_sps(self.nodes, parent_level)
@@ -159,6 +160,11 @@ class Level():
         global CLIENT
         CLIENT.cancel([self.nodes, self.children, self.pc_rels, 
                        self.num_sps, self.cp_rels])
+        
+    def _discover_nodes(self, level_nodes: ddf.DataFrame, state: ddf.Dataframe):
+        """ Mark level nodes as discovered (D) in state array """
+        indices = node_to_i.loc[node_to_i.index.isin(level_nodes["node_id"])]
+        
     
     def _get_self_adj_df(self, level_nodes: ddf.DataFrame, all_adj_df: ddf.DataFrame):
         """ Join level_nodes dataframe with all_adj_df on node_id column.
@@ -183,10 +189,10 @@ class Level():
                                    how = "inner").persist()
         return merged
     
-    def _get_pc_rels(self, adj_df: ddf.DataFrame, 
-                     state: np.ndarray, node_to_i: db.Bag):
+    def _get_pc_rels(self, adj_df: ddf.DataFrame, state: ddf.DataFrame):
         """ Return child nodes and parent-child relationships where the parents
         are the nodes belonging to this level. """
+        
         return children_ids, pc_rels
     
     def _get_num_sps(self, level_nodes: ddf.DataFrame, parent_level: Level):
@@ -214,7 +220,7 @@ class Level():
         pass # TODO    
 
 
-def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state, node_to_i):
+def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state: ddf.DataFrame):
     """ Run a parallel breadth-first-search on the graph represented by 
     adjacency_bag, starting at start_node. Returns a list of Levels in order of
     depth and the state array.
@@ -245,7 +251,7 @@ def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state, node_to_i):
     # Run PBFS, accumulating Levels
     parent_level = None    
     while True:
-        new_level = Level(depth, level_nodes, state, node_to_i, parent_level, all_adj_df)
+        new_level = Level(depth, level_nodes, state, parent_level, all_adj_df)
         levels.append(new_level)
         # TODO : mark level_nodes as processed
         level_nodes = new_level.children
@@ -360,13 +366,31 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
+def create_state_df(all_adj_df: ddf.DataFrame, num_nodes: int) -> ddf.DataFrame:
+    """ state dataframe uses node ids as indexes to track each index's state """
+    # Create node to state bag for quick state lookups during PBFS.
+    # This is a little hacky but I'm not sure how else to do this without extra
+    # computes or bringing lots of data into memory lol.
+    # This is done here instead of upstream to avoid cross-contamination with
+    # other PBFSs starting at other start nodes.    
+    lock = Lock()
+    get_next = ("U" for _ in range(num_nodes)) # Use generator b/c list may be big
+    def assign_state(node_id):
+        with lock: # Ensure only one thread can call the generator at a time
+            return (node_id, get_next)
+    node_to_state_bag = all_adj_df.map(lambda adj: adj[0]).map(assign_state)
+    state = node_to_state_bag.to_dataframe(
+        meta = {"node_id": int, "state": object}).setindex(
+            "node_id", sort = True).persist()    
+    return state
 
-def get_initial_edge_scores(start_node, all_adj_df, node_to_i):
+
+def get_initial_edge_scores(start_node: int, all_adj_df: ddf.DataFrame, 
+                            num_nodes: int) -> db.Bag:
     """ Run one PBFS then one PBFS backtrack then collate edge scores.
     Return Bag of Girvan Newman edge scores starting at start_node, of general 
     form Bag of tuples Bag([((pre, post), edge_score), ...]) """
-    num_nodes = node_to_i.count().compute()
-    state = np.full(len(num_nodes), "U", "<U1") # nodes i maps to state i    
+    state = create_state_df(all_adj_df, num_nodes)
     levels, state = pbfs(start_node, all_adj_df, state, node_to_i)
     del state
     
@@ -387,6 +411,7 @@ def get_initial_edge_scores(start_node, all_adj_df, node_to_i):
 def get_edge_scores(component):
     """ Set up and do the edge-score calculation phase of Girvan-Newman on a 
     single component """
+    global CLIENT
     # Get random subset of component nodes.
     # For now, using sample size = quarter the number of nodes in the df.
     component_nodes = get_all_nodes(component)
@@ -395,25 +420,15 @@ def get_edge_scores(component):
     
     # Put component bag into format suitable for set membership testing
     all_adj_df = component.to_dataframe(
-        meta = {"node_id": int, "neighbours": object}).persist()
-    
-    # Create node to index bag for quick state lookups during PBFS
-    # This is a little hacky but I'm not sure how else to do this without extra
-    # computes lol
-    lock = Lock()
-    get_next_i = (i for i in range(num_nodes))
-    def assign_i(node_id):
-        with lock: # Ensure only one thread can call the generator at a time
-            return (node_id, get_next_i)
-    node_to_i = component_nodes.map(assign_i).persist()
+        meta = {"node_id": int, "neighbours": object}).persist()  
     
     # Bag([((pre, post), edge_score), ...])
     all_edge_scores = random_nodes.map(
-        lambda start_node: get_initial_edge_scores(start_node, all_adj_df, 
-                                                   node_to_i)).flatten()
+        lambda start_node: get_initial_edge_scores(
+            start_node, all_adj_df, num_nodes)).flatten()
     
     # Remove persisted items
-    CLIENT.cancel([node_to_i, all_adj_df])
+    CLIENT.cancel(all_adj_df)
     
     # TODO - make the below preserve edge identity (pre, post)
     # Sum edge scores and divide by factor

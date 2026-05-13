@@ -147,11 +147,12 @@ class Level():
                  state: np.ndarray, node_to_i: dict, 
                  parent_level: Level, all_adj_df: ddf.DataFrame):
         """ Store dask graphs in self for later use """
+        global CLIENT
         self.nodes, self.depth = level_nodes, depth
         self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
         self.children, self.pc_rels = self._get_pc_rels(self.adj_df, state, node_to_i)
         self.num_sps, self.cp_rels = self._num_sps(self.nodes, parent_level)
-        del self.adj_df
+        CLIENT.cancel(self.adj_df)
         
     def __del__(self):
         """ Free memory held by persisted dask graphs before deleting """
@@ -177,12 +178,16 @@ class Level():
         without bringing those bags into memory. 
         
         """
-        pass # TODO
+        merged = level_nodes.merge(all_adj_df, 
+                                   on = "node_id", 
+                                   how = "inner").persist()
+        return merged
     
-    def _get_pc_rels(self, adj_df: ddf.DataFrame, state: np.ndarray, node_to_i: dict):
+    def _get_pc_rels(self, adj_df: ddf.DataFrame, 
+                     state: np.ndarray, node_to_i: db.Bag):
         """ Return child nodes and parent-child relationships where the parents
         are the nodes belonging to this level. """
-        pass # TODO
+        return children_ids, pc_rels
     
     def _get_num_sps(self, level_nodes: ddf.DataFrame, parent_level: Level):
         """ Return the number of shortest paths to each node on this level, as
@@ -209,7 +214,7 @@ class Level():
         pass # TODO    
 
 
-def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state=None):
+def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state, node_to_i):
     """ Run a parallel breadth-first-search on the graph represented by 
     adjacency_bag, starting at start_node. Returns a list of Levels in order of
     depth and the state array.
@@ -234,10 +239,7 @@ def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state=None):
     
     """
     # Set-up PBFS
-    if not state:
-        num_nodes = adjacency_bag.count().compute()
-        state = np.full(len(num_nodes), "U", "<U1") # nodes i maps to state i
-    depth, level_nodes = 0, ddf.from_dict({"node_id": [start_node]})    
+    depth, level_nodes = 0, ddf.from_dict({"node_id": [start_node]})  
     levels = []    
     
     # Run PBFS, accumulating Levels
@@ -359,11 +361,13 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
 
-def get_initial_edge_scores(start_node, all_adj_df):
+def get_initial_edge_scores(start_node, all_adj_df, node_to_i):
     """ Run one PBFS then one PBFS backtrack then collate edge scores.
     Return Bag of Girvan Newman edge scores starting at start_node, of general 
     form Bag of tuples Bag([((pre, post), edge_score), ...]) """
-    levels, state = pbfs(start_node, all_adj_df)
+    num_nodes = node_to_i.count().compute()
+    state = np.full(len(num_nodes), "U", "<U1") # nodes i maps to state i    
+    levels, state = pbfs(start_node, all_adj_df, state, node_to_i)
     del state
     
     # PBFS backtrack to get edge scores
@@ -383,19 +387,33 @@ def get_initial_edge_scores(start_node, all_adj_df):
 def get_edge_scores(component):
     """ Set up and do the edge-score calculation phase of Girvan-Newman on a 
     single component """
-    # Map random subset of nodes to get_edge_scores.
+    # Get random subset of component nodes.
     # For now, using sample size = quarter the number of nodes in the df.
-    component_nodes = get_all_nodes(component).compute()
-    random_nodes = db.from_sequence(
-        random.sample(component_nodes, int(len(component_nodes)/4)))
+    component_nodes = get_all_nodes(component)
+    num_nodes = component_nodes.count().compute()
+    random_nodes = db.random.sample(component_nodes, int(num_nodes/4))
     
     # Put component bag into format suitable for set membership testing
     all_adj_df = component.to_dataframe(
-        meta = {"node_id": int, "neighbours": object})
+        meta = {"node_id": int, "neighbours": object}).persist()
+    
+    # Create node to index bag for quick state lookups during PBFS
+    # This is a little hacky but I'm not sure how else to do this without extra
+    # computes lol
+    lock = Lock()
+    get_next_i = (i for i in range(num_nodes))
+    def assign_i(node_id):
+        with lock: # Ensure only one thread can call the generator at a time
+            return (node_id, get_next_i)
+    node_to_i = component_nodes.map(assign_i).persist()
     
     # Bag([((pre, post), edge_score), ...])
     all_edge_scores = random_nodes.map(
-        lambda start_node: get_initial_edge_scores(start_node, all_adj_df)).flatten()
+        lambda start_node: get_initial_edge_scores(start_node, all_adj_df, 
+                                                   node_to_i)).flatten()
+    
+    # Remove persisted items
+    CLIENT.cancel([node_to_i, all_adj_df])
     
     # TODO - make the below preserve edge identity (pre, post)
     # Sum edge scores and divide by factor

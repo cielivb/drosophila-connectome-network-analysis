@@ -208,42 +208,36 @@ class Level():
         return merged
     
     
-    def _get_pc_rels(self, adj_df: ddf.DataFrame, state: ddf.DataFrame):
+    def _get_pc_rels(self, state: ddf.DataFrame):
         """ Return child nodes and parent-child relationships where the parents
         are the nodes belonging to this level. 
-        
-        adj_df contains a dataframe of adjacencies for the nodes on this level.
-        
+                
         Nodes on this level have state = D, parents of nodes on this level have
         state = P, and children of nodes on this level have state = U.
         
         """
-        # Get the adjacencies of the nodes on this level 
-        self.adj_bag = adj_df_to_adj_bag(adj_df)
-        # Get candidate children (those node IDs with state = U)
-        self.candidate_children_df = state[state["state"] == "U"]
         
         def keep_children(neighbour_list):
-            """ For each neighbour, keep it if its node id has state U. 
-            Convert neighbour lists to dask dfs to avoid computing for every
-            neighbour in neighbour list (compute once instead)."""
-            neighbour_bag = db.from_sequence(neighbour_list)
-            neighbour_df = neighbour_bag.to_dataframe(
-                meta = {"node_id": int, "syn_count": int})
-            is_child = self.candidate_children_df.index.isin(neighbour_df["node_id"].to_frame())
-            children_nodes = self.candidate_children_df[is_child]
-            children_df = children_nodes.merge(neighbour_df, on = "node_id", 
-                                               how = "inner")
-            children = children_df.to_bag().compute()
+            """ For each neighbour, keep it if its node id has state U.
+            
+            I originally wanted to convert neighbour lists to dask dfs to 
+            avoid computing for every neighbour in neighbour list, but I was
+            struggling with using the isin function (I kept getting 
+            NotImplemented errors)."""
+            children = filter(
+                lambda tup: state.loc[tup[0]]["state"].compute() == "U",
+                neighbour_list)
             return children
         
         # Get parent-child relationships
-        pc_rels = self.adj_bag.map(
+        pc_rels = adj_df_to_adj_bag(self.adj_df).map(
             lambda adj: (adj[0], keep_children(adj[1]))).persist()
         # Get children using parent-child relationships
+        print(pc_rels.compute())
         children = pc_rels.map(
             lambda pctup: filter(
                 lambda ctup: ctup[0], pctup[1])).flatten().persist()
+        
         
         return children, pc_rels
     
@@ -328,7 +322,7 @@ class Level():
         """ Assign task graphs to self for calculating edge scores later """
         global CLIENT
         self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
-        self.children, self.pc_rels = self._get_pc_rels(self.adj_df, state)
+        self.children, self.pc_rels = self._get_pc_rels(state)
         print(self.children.compute())
         self.cp_rels = self._get_cp_rels()
         self.num_sps = self._get_num_sps()

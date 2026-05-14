@@ -125,7 +125,7 @@ def get_num_nodes(adjacency_bag):
 def adj_bag_to_adj_df(adj_bag: db.Bag) -> ddf.DataFrame:
     """ Convert an adjacency bag to an adjacency dataframe """
     adj_df = adj_bag.to_dataframe(
-        meta = {"node_id": int, "neighbours": object})
+        meta = {"node_id": int, "neighbours": object}).persist()
     return adj_df
 
 
@@ -146,7 +146,7 @@ def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
     bringing those bags into memory. 
     
     """
-    adj_bag = adj_df.to_bag().map(lambda tup: (tup[0], tup[1]))
+    adj_bag = adj_df.to_bag().map(lambda tup: (tup[0], tup[1])).persist()
     return adj_bag
 
 
@@ -175,7 +175,7 @@ class Level():
     def __init__(self, depth: int, level_nodes: ddf.DataFrame, 
                  parent_level: "Level"):
         """ Store dask graphs in self for later use """
-        self.nodes, self.depth = level_nodes, depth
+        self.nodes, self.depth = level_nodes.persist(), depth
         self.parent_level = parent_level
         self.children, self.pc_rels = None, None
         self.num_sps, self.cp_rels = None, None
@@ -192,7 +192,7 @@ class Level():
     
     ### Private PBFS functions --------------------------------------------
     
-    def _get_self_adj_df(self, level_nodes: ddf.DataFrame, all_adj_df: ddf.DataFrame):
+    def _get_self_adj_df(self, all_adj_df: ddf.DataFrame):
         """ Join level_nodes dataframe with all_adj_df on node_id column.
         
         Returns an adjacency dataframe where each row corresponds to a node in
@@ -202,7 +202,7 @@ class Level():
         IDs, and the other contains a string representation of their neighbours.
         
         """
-        merged = level_nodes.merge(all_adj_df, 
+        merged = self.nodes.merge(all_adj_df, 
                                    on = "node_id", 
                                    how = "inner").persist()
         return merged
@@ -224,20 +224,19 @@ class Level():
             avoid computing for every neighbour in neighbour list, but I was
             struggling with using the isin function (I kept getting 
             NotImplemented errors)."""
-            children = filter(
-                lambda tup: state.loc[tup[0]]["state"].compute() == "U",
-                neighbour_list)
+            children = list(filter(
+                lambda tup: state.loc[tup[0]]["state"].compute().iloc[0] == "U",
+                neighbour_list))
             return children
         
         # Get parent-child relationships
         pc_rels = adj_df_to_adj_bag(self.adj_df).map(
             lambda adj: (adj[0], keep_children(adj[1]))).persist()
         # Get children using parent-child relationships
-        print(pc_rels.compute())
         children = pc_rels.map(
-            lambda pctup: filter(
-                lambda ctup: ctup[0], pctup[1])).flatten().persist()
-        
+            lambda pctup: list(map(
+                lambda ctup: ctup[0], pctup[1]))).flatten().to_dataframe(
+                    meta = {"node_id": int}).persist()
         
         return children, pc_rels
     
@@ -250,8 +249,9 @@ class Level():
         child parent relationships by converting relationships to a dataframe
         that is then processed by df_to_adjacency_bag
         """
-        if not self.parent_level:
-            cp_rels = db.from_sequence([(self.nodes.compute(), [])]).persist()
+        if self.parent_level is None:
+            cp_rels = db.from_sequence(
+                [(self.nodes["node_id"].compute().iloc[0], [])]).persist()
             return cp_rels
         
         # Expand self.parent_level.pc_rels into a bag containing tuples
@@ -266,12 +266,13 @@ class Level():
                 lambda tup: (tup[0], parent, tup[1]))
             expanded = expanded_bag.compute()
             return expanded
-        self.cp_rel_tuples = self.parent_level.pc_rels.map(expand).flatten()
+        
+        cp_rel_tuples = self.parent_level.pc_rels.map(expand).flatten()
         
         # Create the cp_rel dataframe then convert it to adjacency bag
-        self.cp_rel_df = self.cp_rel_tuples.to_dataframe(
+        cp_rel_df = cp_rel_tuples.to_dataframe(
             meta = {"pre": int, "post": int, "syn_count": int})
-        cp_rels = df_to_adjacency_bag(self.cp_rel_df, undirect = False).persist()  
+        cp_rels = df_to_adjacency_bag(cp_rel_df, undirect = False).persist()
         return cp_rels
     
     
@@ -285,24 +286,32 @@ class Level():
         db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
         where num_paths is the number of shortest paths from start_node to node1 etc
         """
-        if not self.parent_level: # i.e., if this level is the root level
-            num_sps = db.from_sequence([(self.nodes.compute(), 1)]).persist()
+        if self.parent_level is None: # i.e., if this level is the root level
+            num_sps = db.from_sequence(
+                [(self.nodes["node_id"].compute().iloc[0], 1)]).persist()
             return num_sps
         
-        self.parent_num_sps = self.parent_level.num_sps.to_dataframe(
-            meta = {"node_id": int, "num_sps": int}).setindex(
-                "node_id", sort=True)
+        parent_num_sps = self.parent_level.num_sps.to_dataframe(
+            meta = {"node_id": int, "num_sps": int}).set_index(
+                "node_id", sort=True).persist()
+        print(f"\nPARENT NUM SPS = {parent_num_sps.compute()}\n")
+        print(f"TEST = {parent_num_sps.loc[29]["num_sps"].compute().iloc[0]}")
         
         def get_num_sps(adj_tup):
             """ adj_tup of general form 
             (child, [(parent1, syn_count), (parent2, syn_count), ...]) 
             """
             node_id, parent_data = adj_tup
-            parent_bag = db.from_sequence(parent_data)
-            parent_df = parent_bag.map(lambda tup: tup[0]).to_dataframe(
-                meta = {"node_id": int})
-            is_parent = self.parent_num_sps.index.isin(parent_df["node_id"])
-            num_sps = parent_num_sps[is_parent]["num_sps"].sum().compute()
+            parents = list(map(lambda tup: tup[0], parent_data))
+            p_num_sps = list(map(
+                lambda parent: parent_num_sps.loc[parent]["num_sps"], parents))
+            num_sps_pdfs = dask.compute(*p_num_sps)
+            num_sps = sum(map(lambda pdf: pdf.iloc[0], num_sps_pdfs))
+            
+            #num_sps = sum(map(
+                #lambda pdat: parent_num_sps.loc[pdat[0]]["num_sps"].compute().iloc[0], 
+                #parent_data))
+            
             return (node_id, num_sps)
         
         num_sps = self.cp_rels.map(get_num_sps).persist()
@@ -315,15 +324,15 @@ class Level():
         """ Update states of self.nodes in state dataframe to either D or P """
         indexes_to_update = state.index.to_series().isin(self.nodes["node_id"])
         state["state"] = state["state"].mask(indexes_to_update, new_status)
+        state = state.persist()
         return state
     
     
     def process(self, state, all_adj_df):
         """ Assign task graphs to self for calculating edge scores later """
         global CLIENT
-        self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
+        self.adj_df = self._get_self_adj_df(all_adj_df)
         self.children, self.pc_rels = self._get_pc_rels(state)
-        print(self.children.compute())
         self.cp_rels = self._get_cp_rels()
         self.num_sps = self._get_num_sps()
     
@@ -387,9 +396,7 @@ def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state: ddf.DataFrame):
         # Create child level and make it the current level
         parent_level = current_level
         level_nodes = parent_level.children
-        print("Graph size:", len(level_nodes.dask))
-        print("Graph keys:", list(level_nodes.dask.keys())[:20])
-        if level_nodes.count().compute() == 0:
+        if level_nodes.shape[0].compute() == 0:
             break
         depth += 1
     
@@ -502,9 +509,9 @@ def create_state_df(all_adj_df: ddf.DataFrame, num_nodes: int) -> ddf.DataFrame:
     """ state dataframe uses node ids as indexes to track each index's state """
     # This is done here instead of upstream to avoid cross-contamination with
     # other PBFSs starting at other start nodes.    
-    all_adj_df["state"] = "U"
-    state = all_adj_df["state"].to_frame(name = "state")
-    all_adj_df.drop("state", axis=1)
+    state = all_adj_df["node_id"].to_frame().persist()
+    state["state"] = "U"
+    state = state.set_index("node_id", sort=True).persist()
     return state
 
 

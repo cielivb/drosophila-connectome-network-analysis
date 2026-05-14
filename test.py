@@ -386,17 +386,17 @@ class TestPBFS(unittest.TestCase):
         # Do level 0 / root level assertions
         level_0 = levels[0]
         self.assertEqual(level_0.depth, 0)
-        self.assertEqual(set(level_0.nodes.compute()), {29})
-        self.assertEqual(set(level_0.children.compute()), 
+        self.assertEqual(set(level_0.nodes["node_id"].compute()), {29})
+        self.assertEqual(set(level_0.children["node_id"].compute()), 
                          {31, 28, 20, 30})
-        self.assertEqual(set(level_0.pc_rels.compute()), 
-                         {(29, [(31, 2), (28, 3), (20, 2), (30, 1)])})
-        self.assertEqual(set(level_0.cp_rels.compute()), set())
-        self.assertEqual(set(level_0.num_sps.compute()),
-                         {(29, 1)})
+        self.assertEqual(level_0.pc_rels.compute(), 
+                         [(29, [(28, 3), (20, 2), (30, 1), (31, 2)])])
+        self.assertEqual(level_0.cp_rels.compute(), [(29, [])])
+        self.assertEqual(level_0.num_sps.compute(),
+                         [(29, 1)])
         
         # Get memory usage and report results
-        max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag, state))))
+        max_mem = max(memory_usage((run.pbfs, (start_node, adj_df, state))))
         report_test_result(TestPBFS.OUTFILE, "test_case_4",
                            time1, max_mem)
         del adjacency_bag

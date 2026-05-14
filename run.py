@@ -146,7 +146,7 @@ def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
     bringing those bags into memory. 
     
     """
-    adj_bag = adj_df.to_bag().map(lambda tup: (tup[0], eval(tup[1])))
+    adj_bag = adj_df.to_bag().map(lambda tup: (tup[0], tup[1]))
     return adj_bag
 
 
@@ -219,26 +219,26 @@ class Level():
         
         """
         # Get the adjacencies of the nodes on this level 
-        adj_bag = adj_df_to_adj_bag(adj_df)
+        self.adj_bag = adj_df_to_adj_bag(adj_df)
         # Get candidate children (those node IDs with state = U)
-        candidate_children_df = state[state["state"] == "U"]
+        self.candidate_children_df = state[state["state"] == "U"]
         
         def keep_children(neighbour_list):
             """ For each neighbour, keep it if its node id has state U. 
             Convert neighbour lists to dask dfs to avoid computing for every
             neighbour in neighbour list (compute once instead)."""
             neighbour_bag = db.from_sequence(neighbour_list)
-            neighbour_df = ddf.from_bag(neighbour_bag,
-                                        meta = {"node_id", "syn_count"})
-            is_child = candidate_children_df.index.isin(neighbour_df["node_id"])
-            children_nodes = candidate_children_df[is_child]
+            neighbour_df = neighbour_bag.to_dataframe(
+                meta = {"node_id": int, "syn_count": int})
+            is_child = self.candidate_children_df.index.isin(neighbour_df["node_id"].to_frame())
+            children_nodes = self.candidate_children_df[is_child]
             children_df = children_nodes.merge(neighbour_df, on = "node_id", 
                                                how = "inner")
             children = children_df.to_bag().compute()
             return children
         
         # Get parent-child relationships
-        pc_rels = adj_bag.map(
+        pc_rels = self.adj_bag.map(
             lambda adj: (adj[0], keep_children(adj[1]))).persist()
         # Get children using parent-child relationships
         children = pc_rels.map(
@@ -257,8 +257,8 @@ class Level():
         that is then processed by df_to_adjacency_bag
         """
         if not self.parent_level:
-            cp_rels = db.from_sequence([(self.nodes.compute(), [])])
-            return cp_rels.persist()
+            cp_rels = db.from_sequence([(self.nodes.compute(), [])]).persist()
+            return cp_rels
         
         # Expand self.parent_level.pc_rels into a bag containing tuples
         # (child, parent, syn_count)
@@ -272,12 +272,12 @@ class Level():
                 lambda tup: (tup[0], parent, tup[1]))
             expanded = expanded_bag.compute()
             return expanded
-        cp_rel_tuples = self.parent_level.pc_rels.map(expand).flatten()
+        self.cp_rel_tuples = self.parent_level.pc_rels.map(expand).flatten()
         
         # Create the cp_rel dataframe then convert it to adjacency bag
-        cp_rel_df = cp_rel_tuples.to_dataframe(
+        self.cp_rel_df = self.cp_rel_tuples.to_dataframe(
             meta = {"pre": int, "post": int, "syn_count": int})
-        cp_rels = df_to_adjacency_bag(cp_rel_df, undirect = False).persist()  
+        cp_rels = df_to_adjacency_bag(self.cp_rel_df, undirect = False).persist()  
         return cp_rels
     
     
@@ -295,7 +295,7 @@ class Level():
             num_sps = db.from_sequence([(self.nodes.compute(), 1)]).persist()
             return num_sps
         
-        parent_num_sps = self.parent_level.num_sps.to_dataframe(
+        self.parent_num_sps = self.parent_level.num_sps.to_dataframe(
             meta = {"node_id": int, "num_sps": int}).setindex(
                 "node_id", sort=True)
         
@@ -307,7 +307,7 @@ class Level():
             parent_bag = db.from_sequence(parent_data)
             parent_df = parent_bag.map(lambda tup: tup[0]).to_dataframe(
                 meta = {"node_id": int})
-            is_parent = parent_num_sps.index.isin(parent_df["node_id"])
+            is_parent = self.parent_num_sps.index.isin(parent_df["node_id"])
             num_sps = parent_num_sps[is_parent]["num_sps"].sum().compute()
             return (node_id, num_sps)
         
@@ -329,6 +329,7 @@ class Level():
         global CLIENT
         self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
         self.children, self.pc_rels = self._get_pc_rels(self.adj_df, state)
+        print(self.children.compute())
         self.cp_rels = self._get_cp_rels()
         self.num_sps = self._get_num_sps()
     
@@ -392,6 +393,8 @@ def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state: ddf.DataFrame):
         # Create child level and make it the current level
         parent_level = current_level
         level_nodes = parent_level.children
+        print("Graph size:", len(level_nodes.dask))
+        print("Graph keys:", list(level_nodes.dask.keys())[:20])
         if level_nodes.count().compute() == 0:
             break
         depth += 1
@@ -503,9 +506,6 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 
 def create_state_df(all_adj_df: ddf.DataFrame, num_nodes: int) -> ddf.DataFrame:
     """ state dataframe uses node ids as indexes to track each index's state """
-    # Create node to state bag for quick state lookups during PBFS.
-    # This is a little hacky but I'm not sure how else to do this without extra
-    # computes or bringing lots of data into memory lol.
     # This is done here instead of upstream to avoid cross-contamination with
     # other PBFSs starting at other start nodes.    
     all_adj_df["state"] = "U"

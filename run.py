@@ -234,16 +234,67 @@ class Level():
         return self.children, self.pc_rels
     
     
-    def _get_num_sps(self, level_nodes: ddf.DataFrame, parent_level: Level):
-        """ Return the number of shortest paths to each node on this level, as
-        well as the child-parent relationships discovered in the process where
-        the children are the nodes belonging to this level. 
+    def _get_cp_rels(self):
+        """ Get child-parent relationships where the children are the nodes 
+        belonging to this level. 
+        
+        Start with parent_level.pc_rels to get an adjacency bag of this level's
+        child parent relationships by converting relationships to a dataframe
+        that is then processed by df_to_adjacency_bag
+        """
+        # Expand self.parent_level.pc_rels into a bag containing tuples
+        # (child, parent, syn_count)
+        def expand(adj_tup):
+            """ adj_tup of general form 
+            (parent, [(child1, syn_count), (child2, syn_count), ...])
+            """
+            parent, children_list = adj_tup[0], adj_tup[1]
+            children_bag = db.from_sequence(children_list)
+            expanded_bag = children_bag.map(
+                lambda tup: (tup[0], parent, tup[1]))
+            expanded = expanded_bag.compute()
+            return expanded
+        cp_rel_tuples = self.parent_level.pc_rels.map(expand).flatten()
+        
+        # Create the cp_rel dataframe then convert it to adjacency bag
+        cp_rel_df = cp_rel_tuples.to_dataframe(
+            meta = {"pre": int, "post": int, "syn_count": int})
+        cp_rels = df_to_adjacency_bag(cp_rel_df, undirect = False).persist()  
+        return cp_rels
+    
+    
+    def _get_num_sps(self):
+        """ Return the number of shortest paths to each node on this level.
+        
+        Use self.parent.level.num_sps to get the number of shortest paths to 
+        each parent.
         
         The num_shortest_paths bag is of the general form
         db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
         where num_paths is the number of shortest paths from start_node to node1 etc
         """
-        pass # TODO
+        if not self.parent_level: # i.e., if this level is the root level
+            num_sps = db.from_sequence([(self.nodes.compute()[0], 1)])
+            return num_sps
+        
+        parent_num_sps = self.parent_level.num_sps.to_dataframe(
+            meta = {"node_id": int, "num_sps": int}).setindex(
+                "node_id", sort=True)
+        
+        def get_num_sps(adj_tup):
+            """ adj_tup of general form 
+            (child, [(parent1, syn_count), (parent2, syn_count), ...]) 
+            """
+            node_id, parent_data = adj_tup
+            parent_bag = db.from_sequence(parent_data)
+            parent_df = parent_bag.map(lambda tup: tup[0]).to_dataframe(
+                meta = {"node_id": int})
+            is_parent = parent_num_sps.index.isin(parent_df["node_id"])
+            num_sps = parent_num_sps[is_parent]["num_sps"].sum().compute()
+            return (node_id, num_sps)
+        
+        num_sps = self.cp_rels.map(get_num_sps)
+        return num_sps
     
     
     ### PBFS functions ----------------------------------------------------
@@ -261,7 +312,8 @@ class Level():
         global CLIENT        
         adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
         self.children, self.pc_rels = self._get_pc_rels(adj_df, state, node_to_i)
-        self.num_sps, self.cp_rels = self._num_sps(self.nodes, parent_level)
+        self.cp_rels = self._get_cp_rels()
+        self.num_sps = self._num_sps()
         CLIENT.cancel(adj_df)          
     
     ### PBFS Backtrack functions ------------------------------------------

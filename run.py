@@ -42,6 +42,7 @@ from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
+from threading import Lock
 
 CLIENT = None # Assigned properly at bottom of script
 MIN_CLUSTER_SIZE = 30
@@ -121,7 +122,14 @@ def get_num_nodes(adjacency_bag):
     return get_all_nodes(adjacency_bag).count().compute()
 
 
-def adj_df_to_adj_bag(adj_df: ddf.DataFrame):
+def adj_bag_to_adj_df(adj_bag: db.Bag) -> ddf.DataFrame:
+    """ Convert an adjacency bag to an adjacency dataframe """
+    adj_df = adj_bag.to_dataframe(
+        meta = {"node_id": int, "neighbours": object})
+    return adj_df
+
+
+def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
     """ Convert an adjacency dataframe to an adjacency bag.
     
     An adjacency dataframe differs from the original dataframe in that it has
@@ -165,18 +173,22 @@ class Level():
     """
     
     def __init__(self, depth: int, level_nodes: ddf.DataFrame, 
-                 parent_level: Level):
+                 parent_level: "Level"):
         """ Store dask graphs in self for later use """
         self.nodes, self.depth = level_nodes, depth
         self.parent_level = parent_level
         self.children, self.pc_rels = None, None
         self.num_sps, self.cp_rels = None, None
     
+    
     def __del__(self):
         """ Free memory held by persisted dask graphs before deleting """
         global CLIENT
         CLIENT.cancel([self.nodes, self.children, self.pc_rels, 
                        self.num_sps, self.cp_rels])
+    
+    
+    ### Private PBFS functions --------------------------------------------
     
     def _get_self_adj_df(self, level_nodes: ddf.DataFrame, all_adj_df: ddf.DataFrame):
         """ Join level_nodes dataframe with all_adj_df on node_id column.
@@ -297,7 +309,7 @@ class Level():
         return num_sps
     
     
-    ### PBFS functions ----------------------------------------------------
+    ### Public PBFS functions ---------------------------------------------
         
     def update_node_states(self, new_status, state):
         """ Update states of self.nodes in state dataframe to either D or P """
@@ -306,7 +318,8 @@ class Level():
         indexes_to_update = state.index.isin(level_nodes["node_id"])
         state["state"] = state["state"].mask(indexes_to_update, new_status)
         return state
-        
+    
+    
     def process(self, state, all_adj_df):
         """ Assign task graphs to self for calculating edge scores later """
         global CLIENT        
@@ -316,7 +329,8 @@ class Level():
         self.num_sps = self._num_sps()
         CLIENT.cancel(adj_df)          
     
-    ### PBFS Backtrack functions ------------------------------------------
+    
+    ### Public PBFS Backtrack functions -----------------------------------
     
     def assign_credit(self, to_child_edge_scores=None):
         """ 
@@ -324,6 +338,7 @@ class Level():
         of 1 plus the sum of the credits of the DAG edges from that node to the 
         level below. A leaf node will only have a credit of 1. """
         pass # TODO
+    
     
     def get_edge_scores(self):
         """ Return Bag of tuples Bag([((pre, post), edge_score), ...])
@@ -535,8 +550,7 @@ def get_edge_scores(component):
     random_nodes = db.random.sample(component_nodes, int(num_nodes/4))
     
     # Put component bag into format suitable for set membership testing
-    all_adj_df = component.to_dataframe(
-        meta = {"node_id": int, "neighbours": object}).persist()  
+    all_adj_df = adj_bag_to_adj_df(component).persist()
     
     # Bag([((pre, post), edge_score), ...])
     all_edge_scores = random_nodes.map(

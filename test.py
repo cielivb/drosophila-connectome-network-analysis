@@ -11,6 +11,7 @@ from dask.distributed import Client
 from datetime import datetime
 from memory_profiler import memory_usage
 from pandas.testing import assert_frame_equal
+from pandas.testing import assert_series_equal
 from time import time
 
 import run
@@ -355,40 +356,49 @@ class TestPBFS(unittest.TestCase):
         """ Combines case 3 and case 1 """
         df = ddf.concat([get_six_node_cycle_dask_df(),
                          get_twelve_node_dask_df()], axis=0)
-        adjacency_bag = run.df_to_adjacency_bag(df).persist()
+        adj_df = run.adj_bag_to_adj_df(
+            run.df_to_adjacency_bag(df)).persist()
+        state = run.create_state_df(adj_df, num_nodes = 18)
         start_node = 29
-        exp_leaves = {22, 24, 25, 26, 27, 30}
-        exp_parent_adj = [(22, [(21, 5), (23, 2)]), (24, [(31, 2)]),
-                          (25, [(31, 2)]), (26, [(31, 2)]), 
-                          (27, [(31, 3), (28, 4)]), (30, [(29, 1)]),
-                          (23, [(31, 1)]), (21, [(20, 7)]), (20, [(29, 2)]),
-                          (31, [(29, 2)]), (28, [(29, 3)]), (29, [])]  
-        exp_parent_adj = process_computed_adjacency_bag(exp_parent_adj)
         
+        #exp_parent_adj = [(22, [(21, 5), (23, 2)]), (24, [(31, 2)]),
+                          #(25, [(31, 2)]), (26, [(31, 2)]), 
+                          #(27, [(31, 3), (28, 4)]), (30, [(29, 1)]),
+                          #(23, [(31, 1)]), (21, [(20, 7)]), (20, [(29, 2)]),
+                          #(31, [(29, 2)]), (28, [(29, 3)]), (29, [])]  
+        #exp_parent_adj = process_computed_adjacency_bag(exp_parent_adj)
+                
         # Time it
         start_time = time()
-        parents_bag, state, leaves, num_sps = run.pbfs(start_node, adjacency_bag)
+        levels, state = run.pbfs(start_node, adj_df, state)
         time1 = time() - start_time
-        leaves = leaves.compute()
-        num_sps = num_sps.compute()
         
-        # Do assertions
-        parent_adj = process_computed_adjacency_bag(parents_bag.compute())
-        print(parent_adj)
-        print(exp_parent_adj)
-        self.assertEqual(parent_adj, exp_parent_adj)
-        self.assertEqual(18, len(state))
-        self.assertEqual(12, np.sum(state == "P"))
-        self.assertEqual(6, np.sum(state == "U"))
-        self.assertTrue(len(leaves) == 6)
-        self.assertTrue(exp_leaves == set(leaves))
-        self.assertTrue((22, 74) in num_sps)
-        self.assertTrue((21, 14) in num_sps)
+        # Do state assertions
+        exp_state = pd.Series(["P" for _ in range(12)], name="state")        
+        state = state.compute()
+        state_counts = state["state"].value_counts().to_dict()
+        self.assertEqual(state_counts["P"], 12)
+        self.assertEqual(state_counts["U"], 6)
+        
+        # Do level assertions
+        self.assertEqual(len(levels), 4)
+        
+        # Do level 0 / root level assertions
+        level_0 = levels[0]
+        self.assertEqual(level_0.depth, 0)
+        self.assertEqual(set(level_0.nodes.compute()), {29})
+        self.assertEqual(set(level_0.children.compute()), 
+                         {31, 28, 20, 30})
+        self.assertEqual(set(level_0.pc_rels.compute()), 
+                         {(29, [(31, 2), (28, 3), (20, 2), (30, 1)])})
+        self.assertEqual(set(level_0.cp_rels.compute()), set())
+        self.assertEqual(set(level_0.num_sps.compute()),
+                         {(29, 1)})
         
         # Get memory usage and report results
-        #max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag))))
-        #report_test_result(TestPBFS.OUTFILE, "test_case_4",
-        #                   time1, max_mem)
+        max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag, state))))
+        report_test_result(TestPBFS.OUTFILE, "test_case_4",
+                           time1, max_mem)
         del adjacency_bag
         
         

@@ -179,13 +179,15 @@ class Level():
         self.parent_level = parent_level
         self.children, self.pc_rels = None, None
         self.num_sps, self.cp_rels = None, None
+        self.adj_df = None
     
     
-    def __del__(self):
+    def close(self):
         """ Free memory held by persisted dask graphs before deleting """
         global CLIENT
         CLIENT.cancel([self.nodes, self.children, self.pc_rels, 
                        self.num_sps, self.cp_rels])
+            
     
     
     ### Private PBFS functions --------------------------------------------
@@ -236,14 +238,14 @@ class Level():
             return children
         
         # Get parent-child relationships
-        self.pc_rels = adj_bag.map(
+        pc_rels = adj_bag.map(
             lambda adj: (adj[0], keep_children(adj[1]))).persist()
         # Get children using parent-child relationships
-        self.children = pc_rels.map(
+        children = pc_rels.map(
             lambda pctup: filter(
                 lambda ctup: ctup[0], pctup[1])).flatten().persist()
         
-        return self.children, self.pc_rels
+        return children, pc_rels
     
     
     def _get_cp_rels(self):
@@ -254,6 +256,10 @@ class Level():
         child parent relationships by converting relationships to a dataframe
         that is then processed by df_to_adjacency_bag
         """
+        if not self.parent_level:
+            cp_rels = db.from_sequence([(self.nodes.compute(), [])])
+            return cp_rels.persist()
+        
         # Expand self.parent_level.pc_rels into a bag containing tuples
         # (child, parent, syn_count)
         def expand(adj_tup):
@@ -286,7 +292,7 @@ class Level():
         where num_paths is the number of shortest paths from start_node to node1 etc
         """
         if not self.parent_level: # i.e., if this level is the root level
-            num_sps = db.from_sequence([(self.nodes.compute()[0], 1)])
+            num_sps = db.from_sequence([(self.nodes.compute(), 1)]).persist()
             return num_sps
         
         parent_num_sps = self.parent_level.num_sps.to_dataframe(
@@ -305,7 +311,7 @@ class Level():
             num_sps = parent_num_sps[is_parent]["num_sps"].sum().compute()
             return (node_id, num_sps)
         
-        num_sps = self.cp_rels.map(get_num_sps)
+        num_sps = self.cp_rels.map(get_num_sps).persist()
         return num_sps
     
     
@@ -313,21 +319,18 @@ class Level():
         
     def update_node_states(self, new_status, state):
         """ Update states of self.nodes in state dataframe to either D or P """
-        if new_status not in {"D", "P"}: 
-            raise Exception(f"Invalid new status {new_status}. Must be D or P.")
-        indexes_to_update = state.index.isin(level_nodes["node_id"])
+        indexes_to_update = state.index.to_series().isin(self.nodes["node_id"])
         state["state"] = state["state"].mask(indexes_to_update, new_status)
         return state
     
     
     def process(self, state, all_adj_df):
         """ Assign task graphs to self for calculating edge scores later """
-        global CLIENT        
-        adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
-        self.children, self.pc_rels = self._get_pc_rels(adj_df, state, node_to_i)
+        global CLIENT
+        self.adj_df = self._get_self_adj_df(self.nodes, all_adj_df)
+        self.children, self.pc_rels = self._get_pc_rels(self.adj_df, state)
         self.cp_rels = self._get_cp_rels()
-        self.num_sps = self._num_sps()
-        CLIENT.cancel(adj_df)          
+        self.num_sps = self._get_num_sps()
     
     
     ### Public PBFS Backtrack functions -----------------------------------
@@ -372,7 +375,8 @@ def pbfs(start_node: int, all_adj_df: ddf.DataFrame, state: ddf.DataFrame):
     
     """
     # Set-up PBFS
-    depth, level_nodes = 0, ddf.from_dict({"node_id": [start_node]})  
+    depth, level_nodes = 0, ddf.from_dict({"node_id": [start_node]}, 
+                                          npartitions=1)  
     levels = []    
     
     # Run PBFS, accumulating Levels
@@ -504,15 +508,9 @@ def create_state_df(all_adj_df: ddf.DataFrame, num_nodes: int) -> ddf.DataFrame:
     # computes or bringing lots of data into memory lol.
     # This is done here instead of upstream to avoid cross-contamination with
     # other PBFSs starting at other start nodes.    
-    lock = Lock()
-    get_next = ("U" for _ in range(num_nodes)) # Use generator b/c list may be big
-    def assign_state(node_id):
-        with lock: # Ensure only one thread can call the generator at a time
-            return (node_id, get_next)
-    node_to_state_bag = all_adj_df.map(lambda adj: adj[0]).map(assign_state)
-    state = node_to_state_bag.to_dataframe(
-        meta = {"node_id": int, "state": object}).setindex(
-            "node_id", sort = True).persist()    
+    all_adj_df["state"] = "U"
+    state = all_adj_df["state"].to_frame(name = "state")
+    all_adj_df.drop("state", axis=1)
     return state
 
 
